@@ -113,12 +113,17 @@ void GradientApp::StartApplication()
 
     beacon_timer.SetFunction(&GradientApp::SendBeacon, this);
     data_timer  .SetFunction(&GradientApp::SendData,   this);
+    unsolicited_timer.SetFunction(&GradientApp::SendUnsolicited, this);
 
     Simulator::Schedule(Seconds(delay),        &GradientApp::SendBeacon, this);
     Simulator::Schedule(Seconds(delay + 1.0),  &GradientApp::PurgeTable, this);
-    if (!isGateway)
+    if (!isGateway) {
         Simulator::Schedule(Seconds(DATA_PERIOD), &GradientApp::SendData, this);
+        // Schedule first unsolicited send at delay + 5s
+        Simulator::Schedule(Seconds(delay + 5.0), &GradientApp::SendUnsolicited, this);
+    }
 
+    last_routing_table_size = routing_table.size();
     NS_LOG_INFO("START id=0x" << std::hex << id << " gw=" << isGateway);
 }
 
@@ -126,6 +131,7 @@ void GradientApp::StopApplication()
 {
     beacon_timer.Cancel();
     data_timer  .Cancel();
+    unsolicited_timer.Cancel();
 }
 
 // ================================================================
@@ -302,7 +308,7 @@ void GradientApp::SendBeacon()
 }
 
 // ================================================================
-//  SendData  — BẠN TỰ VIẾT
+//  SendData  — Uplink: send to sink every 2s
 // ================================================================
 void GradientApp::SendData()
 {
@@ -310,7 +316,7 @@ void GradientApp::SendData()
     hdr.SetType    (PKT_DATA);
     hdr.SetTTL     (64); 
     hdr.SetSrcId   (id);
-    hdr.SetDestId  (SINK_ID);
+    hdr.SetDestId  (SINK_ID);  // Always send uplink to sink
     hdr.SetSenderId(id);
     
     uint32_t data = 0x12345678;
@@ -320,13 +326,106 @@ void GradientApp::SendData()
     uint16_t nextHop = FindBestNeighbor();
     if (nextHop != 0xFFFF) {
         Unicast(pkt, nextHop);
-        NS_LOG_INFO("DATA SEND id=0x" << std::hex << id 
-                    << " to=0x" << nextHop);
+        NS_LOG_INFO("UPLINK SEND id=0x" << std::hex << id 
+                    << " to=0x" << nextHop
+                    << " (via gradient)");
     }
     else {
-        NS_LOG_INFO("DATA DROP id=0x" << std::hex << id 
-                    << " (no route)");
+        NS_LOG_INFO("UPLINK DROP id=0x" << std::hex << id 
+                    << " (no route to sink)");
     }
+}
+
+// ================================================================
+//  SendDownlinkToNode — Downlink: send to specific node (via backprop)
+// ================================================================
+void GradientApp::SendDownlinkToNode(uint16_t dest_id)
+{
+    if (id != SINK_ID) {
+        NS_LOG_INFO("SendDownlinkToNode: only sink can send downlink");
+        return;
+    }
+
+    GradientHeader hdr;
+    hdr.SetType    (PKT_DATA);
+    hdr.SetTTL     (64); 
+    hdr.SetSrcId   (id);      // Sink is source
+    hdr.SetDestId  (dest_id); // Specific destination
+    hdr.SetSenderId(id);
+    
+    uint32_t data = 0x87654321;
+    Ptr<Packet> pkt = Create<Packet>(&data, 4);
+    pkt->AddHeader(hdr);
+
+    // Find neighbor that has dest_id in backprop_dest
+    uint16_t nextHop = 0xFFFF;
+    for (auto &[nb_id, e] : routing_table) {
+        if (e.backprop_dest.count(dest_id) > 0) {
+            nextHop = nb_id;
+            break;
+        }
+    }
+
+    if (nextHop != 0xFFFF) {
+        Unicast(pkt, nextHop);
+        NS_LOG_INFO("DOWNLINK SEND id=0x" << std::hex << id 
+                    << " dest=0x" << dest_id
+                    << " to=0x" << nextHop
+                    << " (via backprop)");
+    }
+    else {
+        NS_LOG_INFO("DOWNLINK DROP id=0x" << std::hex << id 
+                    << " dest=0x" << dest_id
+                    << " (no backprop route)");
+    }
+}
+
+// ================================================================
+//  SendUnsolicited — Send periodic unsolicited data to seed backprop paths
+// ================================================================
+void GradientApp::SendUnsolicited()
+{
+    // Check if routing table size changed → reset period to 5.0s
+    if (routing_table.size() != last_routing_table_size) {
+        m_unsolicited_period = 5.0;
+        last_routing_table_size = routing_table.size();
+        NS_LOG_INFO("UNSOLICITED period reset: routing_table.size()=" 
+                    << routing_table.size() << " -> period=5.0s");
+    }
+
+    // Create GradientHeader for uplink to sink
+    GradientHeader hdr;
+    hdr.SetType    (PKT_DATA);
+    hdr.SetTTL     (64); 
+    hdr.SetSrcId   (id);
+    hdr.SetDestId  (SINK_ID);
+    hdr.SetSenderId(id);
+    
+    // Payload: 4 bytes
+    uint32_t data = 0xDEADBEEF;
+    Ptr<Packet> pkt = Create<Packet>(&data, 4);
+    pkt->AddHeader(hdr);
+
+    // Find best neighbor via gradient
+    uint16_t nextHop = FindBestNeighbor();
+    if (nextHop != 0xFFFF) {
+        Unicast(pkt, nextHop);
+        NS_LOG_INFO("UNSOLICITED SEND id=0x" << std::hex << id 
+                    << " to_sink via 0x" << nextHop
+                    << " period=" << std::dec << m_unsolicited_period);
+    }
+    else {
+        NS_LOG_INFO("UNSOLICITED DROP id=0x" << std::hex << id 
+                    << " (no route to sink)");
+    }
+
+    // Multiply period by 4, capped at 3 hours (10800s)
+    m_unsolicited_period *= 4.0;
+    if (m_unsolicited_period > MAX_UNSOLICITED_PERIOD)
+        m_unsolicited_period = MAX_UNSOLICITED_PERIOD;
+
+    // Schedule next send
+    unsolicited_timer.Schedule(Seconds(m_unsolicited_period));
 }
 
 // ================================================================
@@ -340,6 +439,16 @@ bool GradientApp::OnReceive(Ptr<NetDevice> dev, Ptr<const Packet> pkt,
 
     uint16_t sender_id = AddrToU16(Mac16Address::ConvertFrom(src));
     if (sender_id == id) return false; // Echo, ignore
+
+    // Check if routing table size changed → reset unsolicited period
+    if (routing_table.size() != last_routing_table_size) {
+        m_unsolicited_period = 5.0;
+        last_routing_table_size = routing_table.size();
+        unsolicited_timer.Cancel();
+        unsolicited_timer.Schedule(Seconds(m_unsolicited_period));
+        NS_LOG_INFO("OnReceive: routing_table.size() changed to " 
+                    << routing_table.size() << ", resetting unsolicited period to 5s");
+    }
 
     Ptr<Packet> copy = pkt->Copy();
     GradientHeader hdr;
@@ -359,32 +468,75 @@ bool GradientApp::OnReceive(Ptr<NetDevice> dev, Ptr<const Packet> pkt,
         uint32_t received_data = 0;
         copy->CopyData((uint8_t*)&received_data, 4);
 
-        if (hdr.GetDestId() == id) {
-            // Packet đến đích
+        uint16_t src_id = hdr.GetSrcId();       // Original source
+        uint16_t dest_id = hdr.GetDestId();     // Final destination
+        uint16_t sender_id_hdr = hdr.GetSenderId();  // Who forwarded to me
+
+        if (dest_id == id) {
+            // ===== DELIVERY: Packet đến đích =====
+            if (isGateway) {
+                routing_table[sender_id].backprop_dest.insert(src_id);
+            }
             NS_LOG_INFO("DATA RECV id=0x" << std::hex << id
-                        << " from=0x" << hdr.GetSrcId()
+                        << " from=0x" << src_id
                         << " data=0x" << received_data);
         }
         else if (hdr.GetTTL() == 0) {
-            // TTL hết, drop packet
+            // TTL expired
             NS_LOG_INFO("DATA DROP id=0x" << std::hex << id 
                         << " TTL expired");
         }
         else {
-            // Forward packet tới next hop
-            GradientHeader new_hdr = hdr;
-            new_hdr.SetTTL(hdr.GetTTL() - 1);
-            new_hdr.SetSenderId(id);
+            // ===== FORWARD =====
+            uint16_t next_hop = 0xFFFF;
 
-            Ptr<Packet> fwd_pkt = copy->Copy();
-            fwd_pkt->AddHeader(new_hdr);
+            if (dest_id == SINK_ID) {
+                // ===== UPLINK: Forward towards sink by gradient =====
+                next_hop = FindBestNeighbor();
+                
+                if (next_hop != 0xFFFF) {
+                    // Record backprop path: src_id can reach back via next_hop
+                    routing_table[next_hop].backprop_dest.insert(src_id);
+                    
+                    NS_LOG_INFO("DATA FWD UPLINK id=0x" << std::hex << id 
+                                << " src=0x" << src_id
+                                << " to=0x" << next_hop
+                                << " (record backprop)");
+                }
+            }
+            else {
+                // ===== DOWNLINK: Forward using backprop_dest =====
+                // Find neighbor that has dest in its backprop_dest
+                for (auto &[nb_id, e] : routing_table) {
+                    if (e.backprop_dest.count(dest_id) > 0) {
+                        next_hop = nb_id;
+                        break;
+                    }
+                }
+                
+                if (next_hop != 0xFFFF) {
+                    NS_LOG_INFO("DATA FWD DOWNLINK id=0x" << std::hex << id 
+                                << " dest=0x" << dest_id
+                                << " to=0x" << next_hop
+                                << " (via backprop)");
+                }
+                else {
+                    NS_LOG_INFO("DATA DROP id=0x" << std::hex << id 
+                                << " dest=0x" << dest_id
+                                << " (no backprop route)");
+                }
+            }
 
-            // Chọn next hop (neighbor có gradient nhỏ nhất, RSSI tốt nhất)
-            uint16_t next_hop = FindBestNeighbor();
             if (next_hop != 0xFFFF) {
+                // Forward packet
+                GradientHeader new_hdr = hdr;
+                new_hdr.SetTTL(hdr.GetTTL() - 1);
+                new_hdr.SetSenderId(id);
+
+                Ptr<Packet> fwd_pkt = copy->Copy();
+                fwd_pkt->AddHeader(new_hdr);
+
                 Unicast(fwd_pkt, next_hop);
-                NS_LOG_INFO("DATA FWD id=0x" << std::hex << id 
-                            << " to=0x" << next_hop);
             }
         }
     }

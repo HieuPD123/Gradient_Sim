@@ -102,7 +102,9 @@ protected:
 private:
     // Timer callbacks
     void SendBeacon ();
-    void SendData   ();
+    void SendData   ();          // Uplink to sink
+    void SendUnsolicited ();     // Periodic unsolicited data (builds backprop)
+    void SendDownlinkToNode (uint16_t dest_id);  // Downlink to specific node
 
     void PurgeTable        ();
     void RecomputeGradient ();
@@ -132,6 +134,12 @@ private:
 
     Timer beacon_timer;
     Timer data_timer;
+    Timer unsolicited_timer;
+
+    // Unsolicited data transmission (for backprop building)
+    double m_unsolicited_period {5.0};      // Start at 5s
+    uint32_t last_routing_table_size {0};   // Track changes
+    static constexpr double MAX_UNSOLICITED_PERIOD = 10800.0;  // 3 hours in seconds
 };  // FIX #4: thêm dấu chấm phẩy
 
 
